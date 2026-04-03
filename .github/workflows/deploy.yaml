@@ -1,0 +1,59 @@
+name: Deploy via OIDC
+
+on:
+  push:
+    branches:
+      - main
+
+permissions:
+  id-token: write
+  contents: read
+
+env:
+  AWS_REGION: ap-south-1
+  ECR_REPO: sample-app
+  ACCOUNT_ID: 389517403286
+  INSTANCE_ID: i-05d9a8ca405b8382a
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure AWS via OIDC
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::389517403286:role/github-actions-oidc-role
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to ECR
+        run: |
+          aws ecr get-login-password --region $AWS_REGION \
+          | docker login --username AWS --password-stdin $ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com
+
+      - name: Build Image
+        run: docker build -t app ./app
+
+      - name: Tag Image
+        run: |
+          docker tag app:latest $ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com/$ECR_REPO:latest
+
+      - name: Push Image
+        run: |
+          docker push $ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com/$ECR_REPO:latest
+
+      - name: Deploy via SSM
+        run: |
+          aws ssm send-command \
+          --instance-ids $INSTANCE_ID \
+          --document-name "AWS-RunShellScript" \
+          --parameters commands='[
+          "aws ecr get-login-password --region ap-south-1 | docker login --username AWS --password-stdin '"$ACCOUNT_ID"'.dkr.ecr.ap-south-1.amazonaws.com",
+          "docker pull '"$ACCOUNT_ID"'.dkr.ecr.ap-south-1.amazonaws.com/'"$ECR_REPO"':latest",
+          "docker ps -q | xargs -r docker stop",
+          "docker ps -aq | xargs -r docker rm",
+          "docker run -d -p 80:80 --name app '"$ACCOUNT_ID"'.dkr.ecr.ap-south-1.amazonaws.com/'"$ECR_REPO"':latest"
+          ]'
