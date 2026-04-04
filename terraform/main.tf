@@ -6,7 +6,7 @@ resource "aws_instance" "app_server" {
   iam_instance_profile = aws_iam_instance_profile.ec2_profile.name
 
   # Add the key pair name here
-  key_name = "txn-key" 
+  key_name = "rizzfitt-key" 
 
   tags = {
     Name = "test-server"
