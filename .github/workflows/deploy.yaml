@@ -73,3 +73,4 @@ jobs:
             "docker stop $OLD_CONTAINER || true",
             "docker rm $OLD_CONTAINER || true"
           ]'
+          # Note: The above command assumes your EC2 instance has the necessary IAM permissions to pull from ECR and manage Docker containers.
