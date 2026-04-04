@@ -1,5 +1,5 @@
 resource "aws_ecr_repository" "app_repo" {
-  name = "sample-app"
+  name = "rizzfitt-application"
 
   image_scanning_configuration {
     scan_on_push = true
