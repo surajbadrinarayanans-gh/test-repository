@@ -29,15 +29,11 @@ jobs:
 
       - name: Build, Tag, and Push Image
         env:
-          # Using .outputs.registry to fix the "invalid tag" error
           ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
           ECR_REPOSITORY: ${{ secrets.ECR_REPO_NAME }}
           IMAGE_TAG: latest
         run: |
-          echo "Checking environment variables..."
-          if [ -z "$ECR_REGISTRY" ]; then echo "Error: ECR_REGISTRY is empty. Check OIDC/IAM permissions."; exit 1; fi
-          if [ -z "$ECR_REPOSITORY" ]; then echo "Error: ECR_REPOSITORY secret is empty."; exit 1; fi
-          
+          if [ -z "$ECR_REGISTRY" ]; then echo "ECR_REGISTRY is empty"; exit 1; fi
           docker build -t $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG ./app
           docker push $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
 
@@ -47,30 +43,33 @@ jobs:
           --instance-ids ${{ secrets.EC2_INSTANCE_ID }} \
           --document-name "AWS-RunShellScript" \
           --parameters commands='[
-            "ACTIVE_PORT=$(grep proxy_pass /etc/nginx/nginx.conf | grep -oE \"[0-9]+\" | head -1)",
+            "set -e",
+            "REGISTRY=${{ steps.login-ecr.outputs.registry }}",
+            "REPO=${{ secrets.ECR_REPO_NAME }}",
+            
+            "echo \"Detecting active environment...\"",
+            "ACTIVE_PORT=$(grep proxy_pass /etc/nginx/nginx.conf | grep -oE \"[0-9]+\" | head -1 || echo \"8082\")",
             "if [ \"$ACTIVE_PORT\" = \"8081\" ]; then NEW_PORT=8082; OLD_CONTAINER=app_blue; NEW_CONTAINER=app_green; else NEW_PORT=8081; OLD_CONTAINER=app_green; NEW_CONTAINER=app_blue; fi",
             
-            "echo \"Deploying to $NEW_CONTAINER on port $NEW_PORT...\"",
+            "echo \"Logging into ECR on EC2...\"",
+            "aws ecr get-login-password --region ${{ secrets.AWS_REGION }} | docker login --username AWS --password-stdin $REGISTRY",
             
-            "aws ecr get-login-password --region ${{ secrets.AWS_REGION }} | docker login --username AWS --password-stdin ${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.${{ secrets.AWS_REGION }}.amazonaws.com",
+            "echo \"Pulling new image: $REGISTRY/$REPO:latest\"",
+            "docker pull $REGISTRY/$REPO:latest",
             
-            "docker pull ${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.${{ secrets.AWS_REGION }}.amazonaws.com/${{ secrets.ECR_REPO_NAME }}:latest",
-            
+            "echo \"Starting $NEW_CONTAINER on port $NEW_PORT...\"",
             "docker rm -f $NEW_CONTAINER || true",
-            
-            "docker run -d -p $NEW_PORT:80 --name $NEW_CONTAINER ${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.${{ secrets.AWS_REGION }}.amazonaws.com/${{ secrets.ECR_REPO_NAME }}:latest",
+            "docker run -d -p $NEW_PORT:80 --name $NEW_CONTAINER --restart unless-stopped $REGISTRY/$REPO:latest",
             
             "echo \"Waiting for health check...\"",
             "sleep 15",
+            "curl -f http://localhost:$NEW_PORT || { echo \"Health check failed! Stopping deployment.\"; docker stop $NEW_CONTAINER; exit 1; }",
             
-            "curl -f http://localhost:$NEW_PORT || { echo \"Health check failed\"; docker stop $NEW_CONTAINER; exit 1; }",
-            
-            "echo \"Switching Nginx traffic from $ACTIVE_PORT to $NEW_PORT...\"",
+            "echo \"Updating Nginx and reloading...\"",
             "sudo sed -i \"s/$ACTIVE_PORT/$NEW_PORT/g\" /etc/nginx/nginx.conf",
-            "sudo nginx -s reload",
+            "sudo nginx -t && sudo nginx -s reload",
             
-            "echo \"Cleaning up old container $OLD_CONTAINER...\"",
+            "echo \"Deployment successful. Cleaning up $OLD_CONTAINER...\"",
             "docker stop $OLD_CONTAINER || true",
             "docker rm $OLD_CONTAINER || true"
           ]'
-          # Note: The above command assumes your EC2 instance has the necessary IAM permissions to pull from ECR and manage Docker containers.
