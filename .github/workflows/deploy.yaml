@@ -29,10 +29,15 @@ jobs:
 
       - name: Build, Tag, and Push Image
         env:
-          ECR_REGISTRY: ${{ steps.login-ecr.registry }}
+          # Using .outputs.registry to fix the "invalid tag" error
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
           ECR_REPOSITORY: ${{ secrets.ECR_REPO_NAME }}
           IMAGE_TAG: latest
         run: |
+          echo "Checking environment variables..."
+          if [ -z "$ECR_REGISTRY" ]; then echo "Error: ECR_REGISTRY is empty. Check OIDC/IAM permissions."; exit 1; fi
+          if [ -z "$ECR_REPOSITORY" ]; then echo "Error: ECR_REPOSITORY secret is empty."; exit 1; fi
+          
           docker build -t $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG ./app
           docker push $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
 
@@ -60,7 +65,7 @@ jobs:
             
             "curl -f http://localhost:$NEW_PORT || { echo \"Health check failed\"; docker stop $NEW_CONTAINER; exit 1; }",
             
-            "echo \"Switching Nginx traffic to $NEW_PORT...\"",
+            "echo \"Switching Nginx traffic from $ACTIVE_PORT to $NEW_PORT...\"",
             "sudo sed -i \"s/$ACTIVE_PORT/$NEW_PORT/g\" /etc/nginx/nginx.conf",
             "sudo nginx -s reload",
             
