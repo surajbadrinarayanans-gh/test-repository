@@ -9,12 +9,6 @@ permissions:
   id-token: write
   contents: read
 
-env:
-  AWS_REGION: ap-south-1
-  ECR_REPO: sample-app
-  ACCOUNT_ID: 389517403286
-  INSTANCE_ID: i-05d9a8ca405b8382a
-
 jobs:
   deploy:
     runs-on: ubuntu-latest
@@ -26,34 +20,51 @@ jobs:
       - name: Configure AWS via OIDC
         uses: aws-actions/configure-aws-credentials@v4
         with:
-          role-to-assume: arn:aws:iam::389517403286:role/github-actions-oidc-role
-          aws-region: ${{ env.AWS_REGION }}
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ secrets.AWS_REGION }}
 
       - name: Login to ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build, Tag, and Push Image
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr.registry }}
+          ECR_REPOSITORY: ${{ secrets.ECR_REPO_NAME }}
+          IMAGE_TAG: latest
         run: |
-          aws ecr get-login-password --region $AWS_REGION \
-          | docker login --username AWS --password-stdin $ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com
+          docker build -t $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG ./app
+          docker push $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
 
-      - name: Build Image
-        run: docker build -t app ./app
-
-      - name: Tag Image
-        run: |
-          docker tag app:latest $ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com/$ECR_REPO:latest
-
-      - name: Push Image
-        run: |
-          docker push $ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com/$ECR_REPO:latest
-
-      - name: Deploy via SSM
+      - name: Deploy via SSM (True Zero Downtime)
         run: |
           aws ssm send-command \
-          --instance-ids $INSTANCE_ID \
+          --instance-ids ${{ secrets.EC2_INSTANCE_ID }} \
           --document-name "AWS-RunShellScript" \
           --parameters commands='[
-          "aws ecr get-login-password --region ap-south-1 | docker login --username AWS --password-stdin '"$ACCOUNT_ID"'.dkr.ecr.ap-south-1.amazonaws.com",
-          "docker pull '"$ACCOUNT_ID"'.dkr.ecr.ap-south-1.amazonaws.com/'"$ECR_REPO"':latest",
-          "docker ps -q | xargs -r docker stop",
-          "docker ps -aq | xargs -r docker rm",
-          "docker run -d -p 80:80 --name app '"$ACCOUNT_ID"'.dkr.ecr.ap-south-1.amazonaws.com/'"$ECR_REPO"':latest"
+            "ACTIVE_PORT=$(grep proxy_pass /etc/nginx/nginx.conf | grep -oE \"[0-9]+\" | head -1)",
+            "if [ \"$ACTIVE_PORT\" = \"8081\" ]; then NEW_PORT=8082; OLD_CONTAINER=app_blue; NEW_CONTAINER=app_green; else NEW_PORT=8081; OLD_CONTAINER=app_green; NEW_CONTAINER=app_blue; fi",
+            
+            "echo \"Deploying to $NEW_CONTAINER on port $NEW_PORT...\"",
+            
+            "aws ecr get-login-password --region ${{ secrets.AWS_REGION }} | docker login --username AWS --password-stdin ${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.${{ secrets.AWS_REGION }}.amazonaws.com",
+            
+            "docker pull ${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.${{ secrets.AWS_REGION }}.amazonaws.com/${{ secrets.ECR_REPO_NAME }}:latest",
+            
+            "docker rm -f $NEW_CONTAINER || true",
+            
+            "docker run -d -p $NEW_PORT:80 --name $NEW_CONTAINER ${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.${{ secrets.AWS_REGION }}.amazonaws.com/${{ secrets.ECR_REPO_NAME }}:latest",
+            
+            "echo \"Waiting for health check...\"",
+            "sleep 15",
+            
+            "curl -f http://localhost:$NEW_PORT || { echo \"Health check failed\"; docker stop $NEW_CONTAINER; exit 1; }",
+            
+            "echo \"Switching Nginx traffic to $NEW_PORT...\"",
+            "sudo sed -i \"s/$ACTIVE_PORT/$NEW_PORT/g\" /etc/nginx/nginx.conf",
+            "sudo nginx -s reload",
+            
+            "echo \"Cleaning up old container $OLD_CONTAINER...\"",
+            "docker stop $OLD_CONTAINER || true",
+            "docker rm $OLD_CONTAINER || true"
           ]'

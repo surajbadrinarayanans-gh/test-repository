@@ -48,6 +48,7 @@ resource "aws_iam_role" "github_actions_role" {
           }
           StringLike = {
             "token.actions.githubusercontent.com:sub" = "repo:surajbadrinarayanans-gh/test-repo:*"
+            # Change this later
           }
         }
       }
