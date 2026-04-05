@@ -26,5 +26,5 @@ app_port_blue     = 8081
 app_port_green    = 8082
 
 # GitHub OIDC
-github_repo    = "surajbadrinarayanans-gh/test-repo"
+github_repo    = "surajbadrinarayanans-gh/test-repository"
 aws_account_id = "389517403286"   # Your AWS account ID
