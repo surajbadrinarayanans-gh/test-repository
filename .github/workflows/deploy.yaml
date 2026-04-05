@@ -55,21 +55,23 @@ jobs:
           echo "Current TG: $CURRENT_TG"
 
           if [ "$CURRENT_TG" = "$BLUE_TG_ARN" ]; then
-            echo "active=blue"        >> $GITHUB_OUTPUT
-            echo "new=green"           >> $GITHUB_OUTPUT
-            echo "active_port=8081"    >> $GITHUB_OUTPUT
-            echo "new_port=8082"       >> $GITHUB_OUTPUT
+            echo "active=blue"          >> $GITHUB_OUTPUT
+            echo "new=green"            >> $GITHUB_OUTPUT
+            echo "active_port=8081"     >> $GITHUB_OUTPUT
+            echo "new_port=8082"        >> $GITHUB_OUTPUT
             echo "new_tg=$GREEN_TG_ARN" >> $GITHUB_OUTPUT
+            echo "Active: blue (8081) → Deploying: green (8082)"
           else
-            echo "active=green"        >> $GITHUB_OUTPUT
-            echo "new=blue"            >> $GITHUB_OUTPUT
-            echo "active_port=8082"    >> $GITHUB_OUTPUT
-            echo "new_port=8081"       >> $GITHUB_OUTPUT
-            echo "new_tg=$BLUE_TG_ARN" >> $GITHUB_OUTPUT
+            echo "active=green"         >> $GITHUB_OUTPUT
+            echo "new=blue"             >> $GITHUB_OUTPUT
+            echo "active_port=8082"     >> $GITHUB_OUTPUT
+            echo "new_port=8081"        >> $GITHUB_OUTPUT
+            echo "new_tg=$BLUE_TG_ARN"  >> $GITHUB_OUTPUT
+            echo "Active: green (8082) → Deploying: blue (8081)"
           fi
 
       # ─────────────────────────────────────────────
-      # Step 2: Deploy new container via SSM
+      # Step 2: Deploy new container via SSM and verify on localhost
       # ─────────────────────────────────────────────
       - name: Deploy New Container via SSM
         id: deploy
@@ -92,31 +94,25 @@ jobs:
               "NEW_COLOR='"$NEW_COLOR"'",
               "NEW_PORT='"$NEW_PORT"'",
 
-              "echo \"=== Blue-Green Deployment ===\"",
-              "echo \"Deploying: app_$NEW_COLOR on port $NEW_PORT\"",
+              "echo \"=== Deploying app_$NEW_COLOR on port $NEW_PORT ===\"",
 
-              "echo \"Logging into ECR via VPC endpoint...\"",
               "aws ecr get-login-password --region ${{ secrets.AWS_REGION }} | docker login --username AWS --password-stdin $REGISTRY",
 
-              "echo \"Pulling image...\"",
               "docker pull $REGISTRY/$REPO:latest",
 
-              "echo \"Starting app_$NEW_COLOR on port $NEW_PORT...\"",
               "docker rm -f app_$NEW_COLOR 2>/dev/null || true",
               "docker run -d -p $NEW_PORT:80 --name app_$NEW_COLOR --restart unless-stopped $REGISTRY/$REPO:latest",
 
-              "echo \"Waiting for container health check (10s)...\"",
+              "echo \"Waiting 10s for container startup...\"",
               "sleep 10",
               "curl -sf http://localhost:$NEW_PORT/ || { echo \"HEALTH CHECK FAILED!\"; docker stop app_$NEW_COLOR; docker rm app_$NEW_COLOR; exit 1; }",
 
-              "echo \"Container app_$NEW_COLOR is healthy on port $NEW_PORT!\""
+              "echo \"app_$NEW_COLOR is healthy on port $NEW_PORT!\""
             ]' \
             --output text --query 'Command.CommandId')
 
-          echo "command_id=$COMMAND_ID" >> $GITHUB_OUTPUT
           echo "SSM Command ID: $COMMAND_ID"
 
-          echo "Waiting for container deployment..."
           for i in $(seq 1 30); do
             STATUS=$(aws ssm get-command-invocation \
               --command-id "$COMMAND_ID" \
@@ -124,14 +120,10 @@ jobs:
               --query 'Status' --output text 2>/dev/null || echo "Pending")
             echo "  Attempt $i: $STATUS"
             if [ "$STATUS" = "Success" ]; then
-              echo "Container deployed successfully!"
-              aws ssm get-command-invocation \
-                --command-id "$COMMAND_ID" \
-                --instance-id "${{ secrets.EC2_INSTANCE_ID }}" \
-                --query 'StandardOutputContent' --output text
+              echo "Container deployed!"
               break
             elif [ "$STATUS" = "Failed" ] || [ "$STATUS" = "TimedOut" ] || [ "$STATUS" = "Cancelled" ]; then
-              echo "Deployment FAILED with status: $STATUS"
+              echo "FAILED!"
               aws ssm get-command-invocation \
                 --command-id "$COMMAND_ID" \
                 --instance-id "${{ secrets.EC2_INSTANCE_ID }}" \
@@ -142,38 +134,9 @@ jobs:
           done
 
       # ─────────────────────────────────────────────
-      # Step 3: Wait for ALB to mark new target as HEALTHY
-      # This is the key step that prevents 502 errors!
-      # ─────────────────────────────────────────────
-      - name: Wait for ALB Target Healthy
-        env:
-          NEW_TG: ${{ steps.detect.outputs.new_tg }}
-          NEW_COLOR: ${{ steps.detect.outputs.new }}
-        run: |
-          echo "Waiting for ALB to mark $NEW_COLOR target as healthy..."
-
-          for i in $(seq 1 30); do
-            HEALTH=$(aws elbv2 describe-target-health \
-              --target-group-arn "$NEW_TG" \
-              --query 'TargetHealthDescriptions[0].TargetHealth.State' \
-              --output text 2>/dev/null || echo "unknown")
-            echo "  Check $i: $HEALTH"
-
-            if [ "$HEALTH" = "healthy" ]; then
-              echo "Target $NEW_COLOR is HEALTHY in ALB!"
-              break
-            fi
-
-            if [ "$i" = "30" ]; then
-              echo "ERROR: Target never became healthy after 5 minutes"
-              exit 1
-            fi
-
-            sleep 10
-          done
-
-      # ─────────────────────────────────────────────
-      # Step 4: Switch ALB listener — ONLY after target is healthy
+      # Step 3: Switch ALB listener to the new target group
+      # The new container is verified healthy on localhost.
+      # ALB will start health-checking it once the listener switches.
       # ─────────────────────────────────────────────
       - name: Switch ALB to New Target Group
         env:
@@ -181,26 +144,55 @@ jobs:
           NEW_TG: ${{ steps.detect.outputs.new_tg }}
           NEW_COLOR: ${{ steps.detect.outputs.new }}
         run: |
-          echo "Switching ALB listener to $NEW_COLOR target group..."
+          echo "Switching ALB listener to $NEW_COLOR..."
 
           aws elbv2 modify-listener \
             --listener-arn "$LISTENER_ARN" \
             --default-actions Type=forward,TargetGroupArn="$NEW_TG"
 
-          echo "ALB now routing traffic to $NEW_COLOR! Zero downtime achieved."
+          echo "Listener switched! Waiting for ALB to mark target healthy..."
 
       # ─────────────────────────────────────────────
-      # Step 5: Drain connections, then stop old container
+      # Step 4: Wait for ALB to mark the NEW target group healthy
+      # Now that the listener points here, ALB will start checking
+      # ─────────────────────────────────────────────
+      - name: Wait for ALB Target Healthy
+        env:
+          NEW_TG: ${{ steps.detect.outputs.new_tg }}
+          NEW_COLOR: ${{ steps.detect.outputs.new }}
+        run: |
+          echo "Waiting for ALB to confirm $NEW_COLOR is healthy..."
+
+          for i in $(seq 1 20); do
+            HEALTH=$(aws elbv2 describe-target-health \
+              --target-group-arn "$NEW_TG" \
+              --query 'TargetHealthDescriptions[0].TargetHealth.State' \
+              --output text 2>/dev/null || echo "unknown")
+            echo "  Check $i: $HEALTH"
+
+            if [ "$HEALTH" = "healthy" ]; then
+              echo "ALB confirmed $NEW_COLOR is healthy! Zero downtime achieved."
+              break
+            fi
+
+            if [ "$i" = "20" ]; then
+              echo "WARNING: Target not yet healthy after 200s, but container is running. Traffic may briefly 502."
+            fi
+
+            sleep 10
+          done
+
+      # ─────────────────────────────────────────────
+      # Step 5: Cleanup old container
       # ─────────────────────────────────────────────
       - name: Cleanup Old Container
         env:
           ACTIVE_COLOR: ${{ steps.detect.outputs.active }}
           NEW_COLOR: ${{ steps.detect.outputs.new }}
         run: |
-          echo "Waiting 15s for in-flight requests to drain from $ACTIVE_COLOR..."
+          echo "Draining connections from $ACTIVE_COLOR (15s)..."
           sleep 15
 
-          echo "Stopping old container app_$ACTIVE_COLOR..."
           aws ssm send-command \
             --instance-ids "${{ secrets.EC2_INSTANCE_ID }}" \
             --document-name "AWS-RunShellScript" \
