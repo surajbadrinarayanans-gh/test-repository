@@ -1,6 +1,8 @@
+# ─────────────────────────────────────────────
+# IAM Role — EC2 (SSM + ECR pull access)
+# ─────────────────────────────────────────────
 resource "aws_iam_role" "ec2_ssm_role" {
-  name = "ec2-ssm-ecr-role"
-
+  name = "${var.project_name}-ec2-ssm-ecr-role"
 
   assume_role_policy = jsonencode({
     Version = "2012-10-17"
@@ -14,6 +16,10 @@ resource "aws_iam_role" "ec2_ssm_role" {
       }
     ]
   })
+
+  tags = {
+    Name = "${var.project_name}-ec2-role"
+  }
 }
 
 resource "aws_iam_role_policy_attachment" "ssm" {
@@ -27,12 +33,15 @@ resource "aws_iam_role_policy_attachment" "ecr" {
 }
 
 resource "aws_iam_instance_profile" "ec2_profile" {
-  name = "ec2-ssm-profile"
+  name = "${var.project_name}-ec2-profile"
   role = aws_iam_role.ec2_ssm_role.name
 }
 
+# ─────────────────────────────────────────────
+# IAM Role — GitHub Actions OIDC
+# ─────────────────────────────────────────────
 resource "aws_iam_role" "github_actions_role" {
-  name = "github-actions-oidc-role"
+  name = "${var.project_name}-github-actions-role"
 
   assume_role_policy = jsonencode({
     Version = "2012-10-17"
@@ -40,7 +49,7 @@ resource "aws_iam_role" "github_actions_role" {
       {
         Effect = "Allow"
         Principal = {
-          Federated = "arn:aws:iam::389517403286:oidc-provider/token.actions.githubusercontent.com"
+          Federated = "arn:aws:iam::${var.aws_account_id}:oidc-provider/token.actions.githubusercontent.com"
         }
         Action = "sts:AssumeRoleWithWebIdentity"
         Condition = {
@@ -48,13 +57,16 @@ resource "aws_iam_role" "github_actions_role" {
             "token.actions.githubusercontent.com:aud" = "sts.amazonaws.com"
           }
           StringLike = {
-            "token.actions.githubusercontent.com:sub" = "repo:surajbadrinarayanans-gh/test-repo:*"
-            # Change this later
+            "token.actions.githubusercontent.com:sub" = "repo:${var.github_repo}:*"
           }
         }
       }
     ]
   })
+
+  tags = {
+    Name = "${var.project_name}-github-actions-role"
+  }
 }
 
 resource "aws_iam_role_policy_attachment" "github_ecr" {
