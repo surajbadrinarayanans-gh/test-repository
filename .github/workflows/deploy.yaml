@@ -37,51 +37,48 @@ jobs:
           docker build -t $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG ./app
           docker push $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
 
-      # ─────────────────────────────────────────────
-      # Step 1: Detect → Deploy → Switch → Cleanup (all in one)
-      # Using secrets directly avoids GitHub output masking issues
-      # ─────────────────────────────────────────────
       - name: Blue-Green Deploy
         env:
           ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
           ECR_REPO: ${{ secrets.ECR_REPO_NAME }}
           INSTANCE_ID: ${{ secrets.EC2_INSTANCE_ID }}
           LISTENER_ARN: ${{ secrets.ALB_LISTENER_ARN }}
-          BLUE_TG_ARN: ${{ secrets.BLUE_TG_ARN }}
-          GREEN_TG_ARN: ${{ secrets.GREEN_TG_ARN }}
+          BLUE_TG_ID: ${{ secrets.BLUE_TG_ID }}
+          GREEN_TG_ID: ${{ secrets.GREEN_TG_ID }}
+          AWS_ACCOUNT_ID: ${{ secrets.AWS_ACCOUNT_ID }}
           AWS_REGION_VAL: ${{ secrets.AWS_REGION }}
         run: |
           set -e
+
+          # Construct full TG ARNs from short IDs (avoids GitHub secret masking)
+          BLUE_TG="arn:aws:elasticloadbalancing:${AWS_REGION_VAL}:${AWS_ACCOUNT_ID}:targetgroup/${BLUE_TG_ID}"
+          GREEN_TG="arn:aws:elasticloadbalancing:${AWS_REGION_VAL}:${AWS_ACCOUNT_ID}:targetgroup/${GREEN_TG_ID}"
 
           echo "========================================="
           echo "  BLUE-GREEN DEPLOYMENT"
           echo "========================================="
 
-          # ── Step 1: Detect active environment ──
+          # ── Detect active environment ──
           CURRENT_TG=$(aws elbv2 describe-listeners \
             --listener-arns "$LISTENER_ARN" \
             --query 'Listeners[0].DefaultActions[0].TargetGroupArn' \
             --output text)
 
-          echo "Current listener TG: $CURRENT_TG"
-          echo "Blue TG:  $BLUE_TG_ARN"
-          echo "Green TG: $GREEN_TG_ARN"
+          echo "Current TG: $CURRENT_TG"
 
-          if [ "$CURRENT_TG" = "$BLUE_TG_ARN" ]; then
+          if echo "$CURRENT_TG" | grep -q "blue"; then
             ACTIVE=blue; NEW=green; NEW_PORT=8082; ACTIVE_PORT=8081
-            NEW_TG="$GREEN_TG_ARN"
+            NEW_TG="$GREEN_TG"
           else
             ACTIVE=green; NEW=blue; NEW_PORT=8081; ACTIVE_PORT=8082
-            NEW_TG="$BLUE_TG_ARN"
+            NEW_TG="$BLUE_TG"
           fi
 
-          echo ""
           echo "Active: $ACTIVE (port $ACTIVE_PORT)"
           echo "Deploy: $NEW (port $NEW_PORT)"
-          echo "Switch to TG: $NEW_TG"
           echo ""
 
-          # ── Step 2: Deploy new container via SSM ──
+          # ── Deploy new container via SSM ──
           echo "Deploying app_$NEW on port $NEW_PORT..."
 
           COMMAND_ID=$(aws ssm send-command \
@@ -95,11 +92,8 @@ jobs:
               "NEW='"$NEW"'",
               "NEW_PORT='"$NEW_PORT"'",
 
-              "echo \"Deploying app_$NEW on port $NEW_PORT\"",
-
               "aws ecr get-login-password --region '"$AWS_REGION_VAL"' | docker login --username AWS --password-stdin $REGISTRY",
               "docker pull $REGISTRY/$REPO:latest",
-
               "docker rm -f app_$NEW 2>/dev/null || true",
               "docker run -d -p $NEW_PORT:80 --name app_$NEW --restart unless-stopped $REGISTRY/$REPO:latest",
 
@@ -111,7 +105,6 @@ jobs:
 
           echo "SSM Command: $COMMAND_ID"
 
-          # Wait for SSM to finish
           for i in $(seq 1 30); do
             STATUS=$(aws ssm get-command-invocation \
               --command-id "$COMMAND_ID" \
@@ -119,10 +112,10 @@ jobs:
               --query 'Status' --output text 2>/dev/null || echo "Pending")
             echo "  [$i] $STATUS"
             if [ "$STATUS" = "Success" ]; then
-              echo "Container deployed successfully!"
+              echo "Container deployed!"
               break
             elif [ "$STATUS" = "Failed" ] || [ "$STATUS" = "TimedOut" ] || [ "$STATUS" = "Cancelled" ]; then
-              echo "DEPLOYMENT FAILED!"
+              echo "FAILED!"
               aws ssm get-command-invocation \
                 --command-id "$COMMAND_ID" \
                 --instance-id "$INSTANCE_ID" \
@@ -134,18 +127,17 @@ jobs:
 
           echo ""
 
-          # ── Step 3: Switch ALB listener ──
-          echo "Switching ALB listener to $NEW (TG: $NEW_TG)..."
+          # ── Switch ALB listener ──
+          echo "Switching ALB to $NEW..."
 
           aws elbv2 modify-listener \
             --listener-arn "$LISTENER_ARN" \
             --default-actions Type=forward,TargetGroupArn="$NEW_TG"
 
           echo "Listener switched!"
-          echo ""
 
-          # ── Step 4: Wait for ALB to confirm healthy ──
-          echo "Waiting for ALB health check on $NEW..."
+          # ── Wait for ALB healthy ──
+          echo "Waiting for ALB health check..."
 
           for i in $(seq 1 20); do
             HEALTH=$(aws elbv2 describe-target-health \
@@ -154,7 +146,7 @@ jobs:
               --output text 2>/dev/null || echo "unknown")
             echo "  [$i] $HEALTH"
             if [ "$HEALTH" = "healthy" ]; then
-              echo "ALB confirmed $NEW is healthy!"
+              echo "ALB confirmed healthy!"
               break
             fi
             sleep 10
@@ -162,8 +154,8 @@ jobs:
 
           echo ""
 
-          # ── Step 5: Cleanup old container ──
-          echo "Stopping old container app_$ACTIVE..."
+          # ── Cleanup old container ──
+          echo "Cleaning up app_$ACTIVE..."
           sleep 10
 
           aws ssm send-command \
@@ -171,8 +163,7 @@ jobs:
             --document-name "AWS-RunShellScript" \
             --parameters commands='[
               "docker stop app_'"$ACTIVE"' 2>/dev/null || true",
-              "docker rm app_'"$ACTIVE"' 2>/dev/null || true",
-              "echo \"Removed app_'"$ACTIVE"'\""
+              "docker rm app_'"$ACTIVE"' 2>/dev/null || true"
             ]'
 
           echo ""
