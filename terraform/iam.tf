@@ -100,4 +100,3 @@ resource "aws_iam_role_policy" "github_alb" {
     ]
   })
 }
-# EOF
